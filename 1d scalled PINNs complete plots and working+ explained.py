@@ -1,14 +1,12 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Feb  1 02:26:33 2026
 
-@author: Home
+"""
+Pricing European put option with one underlying with PINNs and comparing the results
 """
 
 import os
 os.environ["DDE_BACKEND"] = "tensorflow"
 
-#############time reversal 1d put pinns for paper1
+
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
@@ -19,7 +17,7 @@ import pandas as pd
 
 def exact_solution(x, tao):
     """
-    Returns the exact solution for a given x and t .
+    Returns the exact solution for a given x and t
 
     Parameters
     ----------
@@ -272,3 +270,4 @@ if __name__ == "__main__":
     
 
     main()
+
