@@ -1,0 +1,320 @@
+'''
+2d final code to be shared on github
+'''
+
+import os
+os.environ["DDE_BACKEND"] = "tensorflow"
+
+import numpy as np
+import deepxde as dde
+from deepxde.backend import tf
+import scipy.stats as si
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import norm
+from sklearn.metrics import r2_score
+import pandas as pd
+from sklearn.metrics import r2_score
+# ============================================================
+# PARAMETERS
+# ============================================================
+r = 0.1
+T_final = 1.0
+
+sigma1 = 0.2
+sigma2 = 0.3
+rho12 = 0.3
+
+K1 = 5
+K2 = 5
+K=5  #since both K1 and K2 are same
+C  = 1.0
+
+eps = 0.002
+b = 2.5*K
+col=15
+
+
+#################
+#functions for plots
+####################
+def plot_single_stock_slice_2d(model, fixed_S1=1.0, tau=0.5,
+                               s2_min=0.05, s2_max=2.0*K,
+                               n_points=20, ci=0.95):
+    z = norm.ppf(0.5 + ci / 2)
+    n_rep=25
+    S2 = np.linspace(s2_min, s2_max, n_points)
+    X = np.column_stack([
+        np.full_like(S2, fixed_S1),
+        S2,
+        np.full_like(S2, tau)
+    ])
+    pinn = model.predict(X).ravel()
+
+    mc_mean = np.zeros(n_points)
+    mc_sd = np.zeros(n_points)
+    for i, s2 in enumerate(S2):
+        mc_mean[i], mc_sd[i], _ = mc_2d_replications(fixed_S1, s2, tau,n_rep=n_rep,n_steps=1)
+    mc_se=mc_sd/np.sqrt(n_rep)
+    plt.figure(figsize=(6,4))
+    plt.plot(S2, pinn, lw=2, label="PINN")
+    plt.errorbar(S2, mc_mean, yerr=z * mc_se, fmt=".", capsize=3,
+                 label=f"MC ({int(ci*100)}% CI)")
+    plt.xlabel("S2")
+    plt.ylabel("Option value")
+    plt.title(f"S1={fixed_S1}, τ={tau}")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+##############
+#MC for numarical comparison
+#####################
+
+
+def mc_2d_replications(S1, S2, tau,n_rep,n_steps):
+
+    n_sim=100000
+    seed=None
+    if seed is not None:
+        np.random.seed(seed)
+
+    cov = np.array([[1.0, rho12],
+                    [rho12, 1.0]])
+    L = np.linalg.cholesky(cov)
+    sig = np.array([sigma1, sigma2])
+    mc_all = np.zeros(n_rep)
+
+    for k in range(n_rep):
+        payoffs = np.zeros(n_sim)
+
+        for j in range(n_sim):
+            s = np.array([S1, S2])
+            dt = tau / n_steps
+
+            for _ in range(n_steps):
+                z = L @ np.random.randn(2)
+                s *= np.exp(
+                    (r - 0.5 * sig**2) * dt
+                    + sig * z * np.sqrt(dt)
+                )
+            payoffs[j] = C if (s[0] < K1 and s[1] < K2) else 0.0
+        mc_all[k] = np.mean(payoffs) * np.exp(-r * tau)
+    return mc_all.mean(), mc_all.std(ddof=1), mc_all
+
+
+
+############
+#PINNs supporting functions: and then main pinns code
+############
+
+def bs_digital_put_1d(S, tau, K, sigma):
+    S = np.maximum(S, 1e-8)
+    tau = np.maximum(tau, 1e-8)
+
+    d2 = (np.log(S / K) + (r - 0.5 * sigma**2) * tau) / (sigma * np.sqrt(tau))
+    return np.exp(-r * tau) * si.norm.cdf(-d2)
+
+
+def payoff_smooth(x):
+    tau_sm=0.01
+    S = x[:, 0:2]      # (N,2)
+    tau = x[:, 2:3]
+
+    # sigmoid approximation of Heaviside
+    ind1 = 1.0 / (1.0 + np.exp((S[:,0:1] - K1) / tau_sm))
+    ind2 = 1.0 / (1.0 + np.exp((S[:,1:2] - K2) / tau_sm))
+    payoff = C * ind1 * ind2
+
+    return payoff
+
+'''
+#this is non smoth payoff for validation only
+def payoff_smooth(x):
+    tau_sm=0.01
+    S = x[:, 0:2]      # (N,2)
+    tau = x[:, 2:3]
+    # # ---- smooth max of (S1, S2) ----
+    # row_max = np.max(S / tau_sm, axis=1, keepdims=True)
+    # exps = np.exp((S / tau_sm) - row_max)
+    # weights = exps / np.sum(exps, axis=1, keepdims=True)
+    # smooth_max = np.sum(weights * S, axis=1, keepdims=True)
+    return payoff
+
+def payoff_nonsmooth(x):
+    S1 = x[:, 0]
+    S2 = x[:, 1]
+
+    payoff = C * ((S1 < K1) & (S2 < K2))
+    return payoff.reshape(-1, 1).astype(np.float64)
+'''
+
+
+def payoff_smooth_ic(x):
+
+    S1 = x[:, 0:1]
+    S2 = x[:, 1:2]
+    tau = x[:, 2:3]
+    eps = 0.1 * tau + 1e-6
+    ind1 = 1.0 / (1.0 + np.exp((S1 - K1) / eps))
+    ind2 = 1.0 / (1.0 + np.exp((S2 - K2) / eps))
+
+    return C * ind1 * ind2
+
+
+def pde(x, y):
+    S1, S2, tau = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+
+    V_S1 = dde.grad.jacobian(y, x, i=0, j=0)
+    V_S2 = dde.grad.jacobian(y, x, i=0, j=1)
+    V_t  = dde.grad.jacobian(y, x, i=0, j=2)
+
+    V_S1S1 = dde.grad.hessian(y, x, i=0, j=0)
+    V_S2S2 = dde.grad.hessian(y, x, i=1, j=1)
+    V_S1S2 = dde.grad.hessian(y, x, i=0, j=1)
+
+    diffusion = 0.5 * (
+        sigma1**2 * S1**2 * V_S1S1
+        + sigma2**2 * S2**2 * V_S2S2
+        + 2 * rho12 * sigma1 * sigma2 * S1 * S2 * V_S1S2
+    )
+
+    drift = r * (S1 * V_S1 + S2 * V_S2)
+    REM=diffusion + drift - r * y
+
+    return V_t - REM
+
+#CONSTRUCTION OF PINNs Using the above functions
+
+geom = dde.geometry.Rectangle([0.0, 0.0], [b, b])
+timedomain = dde.geometry.TimeDomain(0.0, T_final)
+geomtime = dde.geometry.GeometryXTime(geom, timedomain)
+
+
+ic = dde.icbc.IC(geomtime,payoff_smooth,lambda _, on_initial: on_initial)
+
+# (0,0) corner : always ITM
+N_zero = 40
+X_zero = np.column_stack([np.zeros(N_zero),np.zeros(N_zero),
+                          np.random.uniform(0.0, T_final, N_zero)])
+
+bc_zero = dde.icbc.PointSetBC(X_zero, C * np.exp(-r * X_zero[:, 2:3]))
+
+# S1 = 0 : reduces to 1D binary PUT on S2
+def bc_S1_zero(x):
+    S2 = x[:, 1:2]
+    tau = x[:, 2:3]
+    return C * bs_digital_put_1d(S2, tau, K2, sigma2)
+
+bc_S1_0 = dde.DirichletBC(geomtime,bc_S1_zero,lambda x, on_b: on_b and np.isclose(x[0], 0.0))
+
+# S2 = 0 : reduces to 1D binary PUT on S1
+def bc_S2_zero(x):
+    S1 = x[:, 0:1]
+    tau = x[:, 2:3]
+    return C * bs_digital_put_1d(S1, tau, K1, sigma1)
+
+bc_S2_0 = dde.DirichletBC(geomtime,bc_S2_zero,lambda x, on_b: on_b and np.isclose(x[1], 0.0))
+
+# Large-asset boundaries 
+bc_S1_max = dde.DirichletBC( geomtime,lambda x: 0.0,lambda x, on_b: on_b and np.isclose(x[0], b))
+
+bc_S2_max = dde.DirichletBC(geomtime,lambda x: 0.0,lambda x, on_b: on_b and np.isclose(x[1], b))
+
+bcs = [ic, bc_zero,bc_S1_0,bc_S2_0,bc_S1_max,bc_S2_max]
+
+
+# ============================================================
+# DATA + MODEL
+# ============================================================
+data = dde.data.TimePDE(
+    geomtime,
+    pde,
+    bcs,
+    num_domain=2000*col,
+    num_boundary=200*col,
+    num_initial=100*col,
+)
+
+net = dde.nn.FNN(
+    [3] + [30] *3+ [1],"tanh","Glorot uniform")
+
+'''
+#TRIED: did not improve
+net.apply_output_transform(lambda x, y: C * tf.sigmoid(y))
+
+net.apply_output_transform(lambda x, y: tf.nn.softplus(y))
+
+'''
+
+model = dde.Model(data, net)
+lenbc=len(bcs)-1
+model.compile("adam", lr=1e-4,loss_weights=[5,1]+[5]*lenbc)
+model.train(epochs=10000, display_every=1000)
+
+model.compile("L-BFGS",loss_weights=[5,1]+[5]*lenbc)
+model.train()
+
+dde.saveplot(model.losshistory, model.train_state, issave=True, isplot=True)
+
+
+#####################
+#EVALUATION
+####################
+N_test = 1000
+    # reduce number for speed; increase for final evaluationg
+np.random.seed(42)
+b2=2
+S1s = np.random.uniform(0.01, b2, N_test)
+S2s = np.random.uniform(0.01, b2, N_test)
+taus = np.random.uniform(0.0, T_final, N_test)  # time-to-maturity
+
+X= np.column_stack((S1s, S2s, taus))
+
+y_true = np.zeros((N_test))
+
+
+    # Obtain the value of the exact solution for each generated point:
+for i in range(N_test):
+        S1, S2,  t = X[i]
+        y_true[i],_,_ = mc_2d_replications(S1, S2, t,n_rep=1,n_steps=50)
+        if (i + 1) % 20 == 0:
+            print(f"Completed {i + 1} runs")
+
+y_pred = model.predict(X)
+y_pred = y_pred[:, 0] #just a precaution
+print("L2 relative error:", dde.metrics.l2_relative_error(y_true, y_pred))
+
+
+
+    # Filter
+y_true_filtered = y_true*C
+y_pred_filtered = y_pred*C
+
+
+mse =dde.metrics.mean_squared_error(y_true_filtered, y_pred_filtered)
+print("rmse=",np.sqrt(mse))
+
+e=dde.metrics.mean_absolute_percentage_error(y_true_filtered, y_pred_filtered)
+print("mean_absolute_percentage_error=",e)
+
+c=dde.metrics.l2_relative_error(y_true_filtered, y_pred_filtered)
+print('l2_relative_error=',c)
+
+print("r2=",r2_score(y_true_filtered, y_pred_filtered))     
+
+
+# #################
+#some plots
+####################################
+
+
+plot_single_stock_slice_2d(model, fixed_S1=0.5, tau=1.0)
+plot_single_stock_slice_2d(model, fixed_S1=0.9, tau=1.0)
+plot_single_stock_slice_2d(model, fixed_S1=1.0, tau=1.0)
+plot_single_stock_slice_2d(model, fixed_S1=1.1, tau=1.0)
+
+
+
+
+
