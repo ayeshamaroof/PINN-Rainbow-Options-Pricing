@@ -116,7 +116,6 @@ def main():
 
     # COMPARING WITH EXACT SOLUTION  FOR MODEL EVALUATION
 
-    N=1000
     timedomain1 = dde.geometry.TimeDomain(0, 1)
     geom = dde.geometry.Interval(x_min,x_max)
     geomtime1 = dde.geometry.GeometryXTime(geom, timedomain1)
@@ -141,15 +140,10 @@ def main():
     plt.show()
 
     ###########################
-    #droping points with exact solution zero caause that would creat error
-    thresh=0.0 #1% of strike
-    nonzero_indices = y_true>thresh
-    num_kept=np.sum(nonzero_indices)
-    print("kept points=",num_kept)
-    
-    # Filter y_true and y_pred using these indices
-    y_true_filtered = y_true[nonzero_indices]
-    y_pred_filtered = y_pred[nonzero_indices]
+
+    # Filter y_true and y_pred are same as normal. tried filtering but noticed that dont need it
+    y_true_filtered = y_true*K1
+    y_pred_filtered = y_pred*K1
 
 
     #model parameters/ evaluation matrices   
@@ -170,7 +164,7 @@ def main():
 
 ################### PLOTS at tau=1 #############################
     # Number of points in X-DIM:
-    x_dim= 1000
+    x_dim= 100
 
     x = np.linspace(x_min, x_max, num=x_dim).reshape(x_dim, 1)
   
@@ -191,60 +185,7 @@ def main():
     plt.legend()
     plt.show()
     
-    
-    ##################################
-    err=np.zeros((x_dim))
-    for i in range (x_dim):
-      err[i]=v[i]-results[i]
-    print(np.shape(err))
-    max_err = np.max(np.abs(err))
-    print("Max pointwise error:", max_err*K1)
-
-    
-    plt.xlabel('stock')
-    plt.ylabel('error')
-    plt.title('pointwise error error')
-    plt.plot(x*K1,err*K1,linestyle='--')
-    plt.show()
-    ##################################
-    
-    # ============================================================
-    # 2D diagnostic: error at-the-money (S = K) over time
-    # ============================================================
-    n_t = 300
-    tau_vals = np.linspace(0.1, T, n_t).reshape(-1, 1)
-    S_vals = K * np.ones_like(tau_vals)
-    
-    X_atm = np.hstack((S_vals, tau_vals))
-    
-    # PINN prediction
-    pinn_vals = model.predict(X_atm).ravel()
-    
-    # Exact solution (FIXED)
-    exact_vals = exact_solution(
-        S_vals,
-        tau_vals
-    ).ravel()
-    
-    # Errors
-    abs_err = exact_vals - pinn_vals
-    rel_err = abs_err / (exact_vals + 1e-8)
-    
-    # Plot
-    plt.figure(figsize=(7, 4))
-    plt.plot(tau_vals, abs_err * K1, lw=2)
-    plt.xlabel("Time to maturity $\\tau$")
-    plt.ylabel("error")
-    plt.title("error of scalled PINNs at-the-money (S = K)")
-    plt.show()
-    
-    plt.figure(figsize=(7, 4))
-    plt.plot(tau_vals, rel_err * K1, lw=2)
-    plt.xlabel("Time to maturity $\\tau$")
-    plt.ylabel("relative error")
-    plt.title("error of scalled PINNs at-the-money (S = K)")
-    plt.show()
-
+   
     
    
     
@@ -257,17 +198,19 @@ if __name__ == "__main__":
     # Problem parameters:
     sigma = 0.3
     r = 0.03
-    K = 1
-    K1=4 #scalling factor
+    K = 1 #for the pinns strike is 1
+    K1=4 #we multiply with the original strike br evaluation
     T=1
     #MODEL PARAMETERS FOR nn
-    L = 2.5*K # max domain
-    col=5 
+    L = 2*K # max domain
+    col=10
     
-    #Parameters for evaluation of model
+    #Parameters for evaluation
+    N=1000   # number of points for for evaluation
     x_min, t_min = (0.01, 0.) 
     x_max, t_max = (2*K, T)
     
 
     main()
+
 
