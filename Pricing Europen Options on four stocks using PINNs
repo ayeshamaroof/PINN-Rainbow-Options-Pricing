@@ -1,1 +1,457 @@
+'''
+pricing european option with four underlying stocks using pinns
+'''
 
+import os
+os.environ["DDE_BACKEND"] = "tensorflow"
+
+import numpy as np
+import deepxde as dde
+from deepxde.backend import tf
+from scipy.stats import norm
+import scipy.stats as si
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from sklearn.metrics import r2_score
+####################
+# Model / market parameters
+##############################
+T_final = 1.0   # expiry
+r = 0.1       # risk-free rate
+K = 1.0         # strike (price units)
+K1 = 100.0      # scaling when needed for display (as of the option)
+
+sigma = 0.3
+sigma1 = sigma
+sigma2 = sigma-0.1
+sigma3 = sigma
+sigma4 = sigma-0.1
+
+rho = 0.3
+rho12 = rho
+rho13 = rho
+rho14 = rho
+rho23 = rho
+rho24 = rho
+rho34 = rho
+
+#network parameters
+tau_sm = 0.01 #tuned for 0.05 ,0.01,0.005
+stock_max=2.5
+col=25
+
+#evaluation parameters
+n_sim=100000
+n_st=50
+n_rep=25
+N_test = 1000 # reduce number for speed; increase for final evaluationg
+eval_stock_max=2
+
+####################For plots #################################
+
+#PLOTS FUNs
+def plot_single_stock_slice(
+    model,
+    fixed_S=(0.5, 1.0, 1.5),  # S1, S2, S3 fixed
+    tau=1.0,
+    s4_min=0.01,
+    s4_max=2.25,
+    n_points=40,
+    use_ci=True
+):
+    """
+    Slice where S1, S2, S3 are fixed and S4 varies.
+    """
+
+    s4 = np.linspace(s4_min, s4_max, n_points)
+
+    # Build input matrix
+    X = np.column_stack([
+        np.full_like(s4, fixed_S[0]),  # S1
+        np.full_like(s4, fixed_S[1]),  # S2
+        np.full_like(s4, fixed_S[2]),  # S3
+        s4,                             # S4 varies
+        np.full_like(s4, tau)           # tau
+    ])
+
+    # PINN prediction
+    pinn = model.predict(X).ravel()
+
+    # Monte Carlo reference
+    mc_mean = np.zeros_like(s4)
+    mc_se = np.zeros_like(s4)
+
+    for i, s4i in enumerate(s4):
+        if use_ci:
+            mc_mean[i], mc_se[i], _ = rainbow_option_monte_carlo_replications(
+                fixed_S[0], fixed_S[1], fixed_S[2], s4i, tau
+            )
+        else:
+            mc_mean[i] = rainbow_option_monte_carlo(
+                fixed_S[0], fixed_S[1], fixed_S[2], s4i, tau
+            )
+
+    # Plot
+    plt.figure(figsize=(6,4))
+    plt.plot(s4, pinn, lw=2, label="PINN")
+
+    if use_ci:
+        plt.errorbar(
+            s4,
+            mc_mean,
+            yerr=1.96 * mc_se,
+            fmt=".",
+            capsize=3,
+            label="MC (95% CI)"
+        )
+    else:
+        plt.plot(s4, mc_mean, ".", label="Monte Carlo")
+
+    plt.xlabel("S4")
+    plt.ylabel("Option value")
+    plt.title(f"S1={fixed_S[0]}, S2={fixed_S[1]}, S3={fixed_S[2]}, τ={tau}")
+    plt.legend()
+    plt.show()
+
+#########################################################################
+# Monte Carlo routines
+
+
+def rainbow_option_monte_carlo(S1, S2, S3, S4, horizon_T, n_simulation=n_sim, n_steps=n_st, seed=None):
+    """
+    Single-run Monte Carlo estimator for a call on max(S1..S4).
+    horizon_T: time-to-maturity (tau)
+    Returns: (mc_price, SE_classical, call_payoffs_array)
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    dt = float(horizon_T) / n_steps
+    call = np.zeros(int(n_simulation), dtype=float)
+
+    cov_matrix = np.array([
+        [1, rho12, rho13, rho14],
+        [rho12, 1, rho23, rho24],
+        [rho13, rho23, 1, rho34],
+        [rho14, rho24, rho34, 1]
+    ])
+    L = np.linalg.cholesky(cov_matrix)
+
+    for j in range(int(n_simulation)):
+        s = np.array([S1, S2, S3, S4], dtype=float)
+        for _ in range(int(n_steps)):
+            z = np.random.normal(size=4)
+            e2 = L.dot(z)
+            drift = (r - 0.5 * np.array([sigma1, sigma2, sigma3, sigma4])**2) * dt
+            diffusion = np.array([sigma1, sigma2, sigma3, sigma4]) * e2 * np.sqrt(dt)
+            s *= np.exp(drift + diffusion)
+        payoff = max(np.max(s) - K, 0.0)   # call on max
+        call[j] = payoff
+
+    mc_price = np.mean(call) * np.exp(-r * horizon_T)
+    return mc_price
+
+def rainbow_option_monte_carlo_replications(S1, S2, S3, S4, T, seed=None):
+    """
+    Monte Carlo with multiple replications for standard error calculation.
+    Returns:
+        mc_means: mean of MC replications
+        mc_std_errors: standard error across replications
+        mc_all: array of shape (n_replications,) with individual replication means
+    """
+    n_replications=n_rep
+    n_simulation=n_sim
+    n_steps=n_st
+
+    if seed is not None:
+        np.random.seed(seed)
+
+    mc_all = np.zeros(n_replications, dtype=float)
+
+    for k in range(n_replications):
+        dt = T / n_steps
+        cov_matrix = np.array([
+            [1, rho12, rho13, rho14],
+            [rho12, 1, rho23, rho24],
+            [rho13, rho23, 1, rho34],
+            [rho14, rho24, rho34, 1]
+        ])
+        L = np.linalg.cholesky(cov_matrix)
+
+        payoffs = np.zeros(n_simulation)
+        for j in range(n_simulation):
+            s = np.array([S1, S2, S3, S4], dtype=float)
+            for _ in range(n_steps):
+                z = np.random.normal(size=4)
+                e2 = L.dot(z)
+                s = s * np.exp((r - 0.5 * np.array([sigma1, sigma2, sigma3, sigma4])**2) * dt
+                               + np.array([sigma1, sigma2, sigma3, sigma4]) * e2 * np.sqrt(dt))
+            payoff = max(s) - K
+            payoffs[j] = max(payoff, 0.0)
+        mc_all[k] = np.mean(payoffs) * np.exp(-r * T)
+
+    mc_mean = mc_all.mean()
+    mc_std_error = mc_all.std(ddof=1) /np.sqrt(n_replication) # se across replications
+    return mc_mean, mc_std_error, mc_all
+
+
+# Modified 1D Black-Scholes
+def bs_call_1d(S, tau, sigma):
+    S = np.maximum(S, 1e-8)
+    tau = np.maximum(tau, 1e-8)
+
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * tau) / (sigma * np.sqrt(tau))
+    d2 = d1 - sigma * np.sqrt(tau)
+
+    return S * si.norm.cdf(d1) - K * np.exp(-r * tau) * si.norm.cdf(d2)
+
+
+
+################################################################
+#################################################################
+# PINN
+
+def pde(x, y):
+    x1, x2, x3, x4, t = x[:, 0:1], x[:, 1:2], x[:, 2:3], x[:, 3:4], x[:, 4:5]
+
+    # First derivatives
+    dy_x1 = dde.grad.jacobian(y, x, i=0, j=0)
+    dy_x2 = dde.grad.jacobian(y, x, i=0, j=1)
+    dy_x3 = dde.grad.jacobian(y, x, i=0, j=2)
+    dy_x4 = dde.grad.jacobian(y, x, i=0, j=3)
+
+    # Time derivative
+    dy_t = dde.grad.jacobian(y, x, i=0, j=4)
+
+    # Second derivatives (diagonal)
+    V_xx = (
+        sigma1**2 * x1**2 * dde.grad.hessian(y, x, i=0, j=0)
+      + sigma2**2 * x2**2 * dde.grad.hessian(y, x, i=1, j=1)
+      + sigma3**2 * x3**2 * dde.grad.hessian(y, x, i=2, j=2)
+      + sigma4**2 * x4**2 * dde.grad.hessian(y, x, i=3, j=3)
+    )
+
+    # Mixed derivatives
+    V_xy = (
+        2 * sigma1*sigma2*rho12*x1*x2 * dde.grad.hessian(y, x, i=0, j=1)
+      + 2 * sigma1*sigma3*rho13*x1*x3 * dde.grad.hessian(y, x, i=0, j=2)
+      + 2 * sigma1*sigma4*rho14*x1*x4 * dde.grad.hessian(y, x, i=0, j=3)
+      + 2 * sigma2*sigma3*rho23*x2*x3 * dde.grad.hessian(y, x, i=1, j=2)
+      + 2 * sigma2*sigma4*rho24*x2*x4 * dde.grad.hessian(y, x, i=1, j=3)
+      + 2 * sigma3*sigma4*rho34*x3*x4 * dde.grad.hessian(y, x, i=2, j=3)
+    )
+
+    diffusion = 0.5 * (V_xx + V_xy)
+
+    drift = r * (x1*dy_x1 + x2*dy_x2 + x3*dy_x3 + x4*dy_x4)
+
+    return dy_t - diffusion - drift + r*y
+
+def func_payoff_numpy(x):
+    # convert to TF to use softmax then back, or compute directly in numpy
+    S = x[:, 0:4]
+    tau = x[:, 4:5]
+    # numerical stability: use numpy implementation of softmax row-wise
+    # subtract row-wise max
+    row_max = np.max(S / tau_sm, axis=1, keepdims=True)
+    exps = np.exp((S / tau_sm) - row_max)
+    weights = exps / np.sum(exps, axis=1, keepdims=True)
+    smooth_max = np.sum(weights * S, axis=1, keepdims=True)
+    payoff = np.maximum(smooth_max - K, 0.0)
+    return payoff
+
+def asymptotic_max(x):
+    S = x[:, 0:4]
+    tau = x[:, 4:5]
+    row_max = np.max(S / tau_sm, axis=1, keepdims=True)
+    exps = np.exp((S / tau_sm) - row_max)
+    weights = exps / np.sum(exps, axis=1, keepdims=True)
+    maxS = np.sum(weights * S, axis=1, keepdims=True)
+    return maxS - K * np.exp(-r * tau)
+
+
+def main():
+
+
+    # Geometry and time domain: tau in [0, T_final]
+    b = stock_max
+    xmin = [0.0, 0.0, 0.0, 0.0]
+    xmax = [b, b, b, b]
+    geom = dde.geometry.geometry_nd.Hypercube(xmin=xmin, xmax=xmax)
+    timedomain = dde.geometry.TimeDomain(0.0, T_final)  # tau in [0, T_final]
+    geomtime = dde.geometry.GeometryXTime(geom, timedomain)
+
+     # -------------------------
+     # ZERO boundary condition: S1=S2=S3=S4=0
+     # -------------------------
+    N_z = 20
+    tau_zero = np.random.uniform(0.0, T_final, N_z)
+
+    X_zero = np.column_stack([
+         np.zeros(N_z),
+         np.zeros(N_z),
+         np.zeros(N_z),
+         np.zeros(N_z),
+         tau_zero
+     ])
+
+    y_zero = np.zeros((N_z, 1))
+
+    bc_zero = dde.icbc.PointSetBC(X_zero, y_zero)
+
+    # IC at tau=0 (i.e., time-to-maturity = 0) is payoff at expiry; that's func_payoff_numpy with tau=0
+    bc_ic = dde.icbc.IC(geomtime, func_payoff_numpy, lambda _, on_initial: on_initial)
+
+    #max boundry
+    # drichlet fixed tried neuman didnt improve
+    bc_S1_max = dde.DirichletBC(geomtime, asymptotic_max, lambda x, on_boundary: on_boundary and np.isclose(x[0], b))
+    bc_S2_max = dde.DirichletBC(geomtime, asymptotic_max, lambda x, on_boundary: on_boundary and np.isclose(x[1], b))
+    bc_S3_max = dde.DirichletBC(geomtime, asymptotic_max, lambda x, on_boundary: on_boundary and np.isclose(x[2], b))
+    bc_S4_max = dde.DirichletBC(geomtime, asymptotic_max, lambda x, on_boundary: on_boundary and np.isclose(x[3], b))
+
+    # ONE-STOCK-NONZERO BCs (1D BS faces)
+    N_face = 50
+    eps = 0.0001
+    sigmas = [sigma1, sigma2, sigma3, sigma4]
+
+    bs_face_bcs = []
+
+    for d in range(4):  # active stock index
+        S_active = np.random.uniform(0.01, b, N_face)
+        tau = np.random.uniform(1e-4, T_final, N_face)
+
+        X_face = np.column_stack([
+            S_active if d == 0 else np.full(N_face, eps),
+            S_active if d == 1 else np.full(N_face, eps),
+            S_active if d == 2 else np.full(N_face, eps),
+            S_active if d == 3 else np.full(N_face, eps),
+            tau
+        ])
+
+        # Pass the correct sigma for the active stock
+        y_face = bs_call_1d(S_active, tau, sigma=sigmas[d]).reshape(-1, 1)
+
+        bs_face_bcs.append(dde.icbc.PointSetBC(X_face, y_face))
+
+    # Deep OTM enforcement 
+    N_otm = 10*col  # number of OTM points; can tune
+    X_otm = np.random.uniform(0.0, K * 0.5, (N_otm, 4))  # S1..S4 < 0.5*K
+    tau_otm = np.random.uniform(0.0, T_final, N_otm)
+    X_otm = np.column_stack([X_otm, tau_otm])
+    y_otm = np.zeros((N_otm, 1))
+    bc_otm = dde.icbc.PointSetBC(X_otm, y_otm)
+
+    bcs = [bc_ic, bc_zero, bc_otm,
+        bc_S1_max, bc_S2_max, bc_S3_max, bc_S4_max]+ bs_face_bcs #+ bc_2d_faces+bc_3d_faces
+
+    # Oversampled deep OTM interior points (anchors)
+    N_otm_domain = 20*col  # number of extra domain points
+    S_otm_domain = np.random.uniform(0.0, 0.8*K, (N_otm_domain, 4))
+    tau_otm_domain = np.random.uniform(0.0, T_final, N_otm_domain)
+    X_otm_domain = np.column_stack([S_otm_domain, tau_otm_domain])
+
+
+    # Oversampled deep ITM interior points (anchors)
+    N_itm_domain = 20*col  # number of extra domain points
+    S_itm_domain = np.random.uniform(1.5*K, b*K, (N_itm_domain, 4))  # well above strike
+    tau_itm_domain = np.random.uniform(0.0, T_final, N_itm_domain)
+    X_itm_domain = np.column_stack([S_itm_domain, tau_itm_domain])
+
+
+    # Oversampled ATM interior points (anchors)
+    N_atm_domain = 20*col  # number of extra domain points
+    S_atm_domain = np.random.normal(0.9*K, 1.1*K, (N_atm_domain, 4))  # atmoney
+    tau_atm_domain = np.random.uniform(0.0, T_final, N_atm_domain)
+    X_atm_domain = np.column_stack([S_atm_domain, tau_atm_domain])
+
+
+    X_extra = np.vstack([X_otm_domain, X_itm_domain,X_atm_domain])
+
+    data = dde.data.TimePDE(
+        geomtime, pde, bcs,
+        num_domain=2000 * col,
+        num_initial=200 * col,
+        num_boundary=100 * col,
+        anchors=X_extra ) # combine OTM and ITM oversampled points
+
+
+    # Network: moderately larger to capture complexity
+    net = dde.nn.FNN([5] + [30] *3+ [1], "tanh", "Glorot uniform")
+    net.apply_output_transform(lambda x, y: tf.nn.softplus(y))
+    model = dde.Model(data, net)
+
+    lenbc=len(bcs)-1
+    model.compile("adam", lr=1e-4,loss_weights=[1,5]+[1]*lenbc)
+    model.train(epochs=10000, display_every=1500)
+    model.compile("L-BFGS",loss_weights=[1,5]+[1]*lenbc)
+    losshistory, train_state = model.train()
+
+    dde.saveplot(losshistory, train_state, issave=True, isplot=True)
+
+########################################################
+#EVALUATION
+####################################
+    np.random.seed(42)
+    b2=eval_stock_max
+    S1s = np.random.uniform(0.01, b2, N_test)
+    S2s = np.random.uniform(0.01, b2, N_test)
+    S3s = np.random.uniform(0.01, b2, N_test)
+    S4s = np.random.uniform(0.01, b2, N_test)
+    taus = np.random.uniform(0.0, T_final, N_test)  # time-to-maturity
+
+    X= np.column_stack((S1s, S2s, S3s, S4s, taus))
+
+    y_true = np.zeros((N_test))
+
+
+    # Obtain the value of the MC solution for evaluation for each generated point:
+    for i in range(N_test):
+        S1, S2, S3, S4, t = X[i]
+        y_true[i] = rainbow_option_monte_carlo(S1, S2, S3, S4, t)
+        if (i + 1) % 20 == 0:
+            print(f"Completed {i + 1} runs")
+
+
+    y_pred = model.predict(X)
+    y_pred = y_pred[:, 0]
+
+
+    # unscalling for evaluation
+    y_true_filtered = y_true*K1
+    y_pred_filtered = y_pred*K1
+
+    print("##########################")
+
+
+    mse =dde.metrics.mean_squared_error(y_true_filtered, y_pred_filtered)
+    print("MSE:", mse)
+    print("rmse=",np.sqrt(mse))
+    e=dde.metrics.mean_absolute_percentage_error(y_true_filtered, y_pred_filtered)
+    print('mean_absolute_percentage_error=',e)
+    c=dde.metrics.l2_relative_error(y_true_filtered, y_pred_filtered)
+    print('l2_relative_error=',c,)
+    print("r2=",r2_score(y_true_filtered, y_pred_filtered))
+
+
+
+    # Slices you want to test
+    fixed_slices = [
+        (0.5, 1.0, 1.5),
+        (1.0, 1.0, 1.0),
+        (0.5, 0.5, 0.5),
+        (1.1, 1.1, 1.1),
+    ]
+
+    taus = [1.0]
+
+    for tau in taus:
+        for fs in fixed_slices:
+            plot_single_stock_slice(
+                model,
+                fixed_S=fs,
+                tau=tau
+            )
+
+if __name__ == "__main__":
+    main()
