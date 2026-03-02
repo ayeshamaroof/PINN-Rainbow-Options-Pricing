@@ -1,0 +1,155 @@
+# -*- coding: utf-8 -*-
+"""
+Pricing asian geometric option using pinns
+"""
+
+import numpy as np
+import deepxde as dde
+from deepxde.backend import tf
+from scipy.stats import norm
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+
+# market parameters
+
+K = 4.0
+r = 0.03
+sigma = 0.3
+
+
+#Asian option parameters
+sigma_g = sigma / np.sqrt(3)
+
+#Model parameters
+L = 2.0   # truncated scaled domain
+T = 1.0 # time domain 
+
+
+def exact(x,Te):
+    d1 = (np.log(x) + (r + 0.5*sigma_g**2)*Te) / (sigma_g*np.sqrt(Te))
+    d2 = d1 - sigma_g*np.sqrt(Te)
+    return np.exp(-r*Te)*(x*np.exp(r*Te)*norm.cdf(d1) - norm.cdf(d2))
+
+
+def pde(x, V):
+    X = x[:, 0:1]      # scaled stock x = S/K
+    tau = x[:, 1:2]    # time to maturity ie tau not t
+
+    V_tau = dde.grad.jacobian(V, x, i=0, j=1)
+    V_x = dde.grad.jacobian(V, x, i=0, j=0)
+    V_xx = dde.grad.hessian(V, x, i=0, j=0)
+
+    return (
+        V_tau
+        - 0.5 * sigma_g**2 * X**2 * V_xx
+        - r * X * V_x
+        + r * V
+    )
+
+
+space = dde.geometry.Interval(0.0, L)
+time = dde.geometry.TimeDomain(0.0, T)
+geom = dde.geometry.GeometryXTime(space, time)
+
+
+def payoff(x):
+    X = x[:, 0:1]
+    return np.maximum(X - 1.0, 0.0)
+
+ic = dde.icbc.IC(
+    geom,
+    payoff,
+    lambda _, on_initial: on_initial,
+)
+
+
+# stock = 0
+bc_left = dde.icbc.DirichletBC(
+    geom,
+    lambda x: 0.0,
+    lambda x, on_boundary: on_boundary and np.isclose(x[0], 0.0),
+)
+
+# stock = L
+def boundary_right(x):
+    tau = x[:, 1:2]
+    return L - np.exp(-r * tau)
+
+bc_right = dde.icbc.DirichletBC(
+    geom,
+    boundary_right,
+    lambda x, on_boundary: on_boundary and np.isclose(x[0], L),
+)
+
+
+col=10
+data = dde.data.TimePDE(
+    geom,
+    pde,
+    [bc_left, bc_right, ic],
+    num_domain=2000*col,
+    num_boundary=100*col,
+    num_initial=200*col
+)
+
+
+net = dde.nn.FNN([2] + [30] * 3 + [1], "tanh", "Glorot normal")
+net.apply_output_transform(lambda x,y:tf.nn.softplus(y)) # to ensure positive output
+model = dde.Model(data, net)
+
+
+
+# Build and train the model:
+
+model.compile("adam", lr=0.0001,loss_weights =[1,5,1,1])
+model.train(epochs=5000)
+model.compile("L-BFGS",loss_weights =[1,5,1,1])
+losshistory, train_state = model.train()
+
+# Plot/print the results
+dde.saveplot(losshistory, train_state, issave=True, isplot=True)
+
+
+# MODEL EVALUATION
+x_min, x_max = 0.0, 2.0
+N=1000
+timedomain1 = dde.geometry.TimeDomain(0, 1)
+geom = dde.geometry.Interval(x_min,x_max)
+geomtime1 = dde.geometry.GeometryXTime(geom, timedomain1)
+X=geomtime1.random_points(N)
+y_true = np.zeros((N))
+y_pred=np.zeros((N))
+
+  
+for i in range(N):
+     y_true[i] = exact(X[i][0],X[i][1])
+     y_pred[i]=model.predict([(X[i][0],X[i][1])])
+
+   #######################################
+error = (y_true-y_pred)
+max_err_num = np.max(np.abs(error))
+print("Max error#####:=", max_err_num)
+
+plt.xlabel('(MC-PINN)/Strike')
+plt.ylabel('density')
+plt.title('error distribution')
+sns.histplot(error, kde=False, bins=50)
+plt.show()
+
+   ###########################
+#EVALuation
+mse =dde.metrics.mean_squared_error(y_true, y_pred)
+print("MSE:", mse)
+print("RMSE=",np.sqrt(mse))
+
+
+c=dde.metrics.l2_relative_error(y_true, y_pred)
+print('l2_relative_error=',c)
+f=dde.metrics.nanl2_relative_error(y_true, y_pred)
+print('nanl2_relative_error=',f)
+from sklearn.metrics import r2_score
+print("r2=",r2_score(y_true, y_pred))
+
+
